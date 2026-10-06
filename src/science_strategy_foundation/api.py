@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlparse
 from .errors import DomainError, ValidationError
 from .service import DomainService
 from .storage import Database
+from .trial_service import TrialService
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
@@ -48,11 +49,73 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        trial_response = _route_trial(service, method, parsed.path, parse_qs(parsed.query), body,
+                                      actor_id)
+        if trial_response is not None:
+            status, payload = trial_response
+            return status, payload
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
     except (TypeError, ValueError) as exc:
         return 400, {"error": "invalid_request", "message": str(exc)}
+
+
+# 幂等写入端点：路径 → 服务方法
+_TRIAL_POST_ENDPOINTS = {
+    "/seed-lots": "register_seed_lot",
+    "/seed-lots/withdraw": "withdraw_seed_lot",
+    "/plots": "register_plot",
+    "/protocols": "register_protocol",
+    "/protocol-plots": "assign_plot",
+    "/farm-operations": "record_operation",
+    "/weather": "record_weather",
+    "/devices": "register_device",
+    "/calibrations": "record_calibration",
+    "/exclusion-rules": "register_exclusion_rule",
+    "/observations": "ingest_observation",
+    "/reviews/resolve": "resolve_review",
+    "/analyses": "freeze_analysis",
+    "/rulings": "propose_ruling",
+}
+
+
+def _route_trial(service, method: str, path: str, query: dict, body: dict[str, Any],
+                 actor_id: str):
+    """分派农业试验裁定相关路由；不匹配时返回 None。"""
+
+    if not isinstance(service, TrialService):
+        return None
+    segments = [segment for segment in path.split("/") if segment]
+
+    if method == "POST" and path in _TRIAL_POST_ENDPOINTS:
+        result = getattr(service, _TRIAL_POST_ENDPOINTS[path])(actor_id=actor_id, **body)
+        return 200 if result.get("replayed") else 201, result
+
+    if method == "GET" and len(segments) == 2 and segments[0] == "analyses":
+        return 200, service.get_analysis(segments[1])
+
+    if method == "GET" and len(segments) == 2 and segments[0] == "rulings":
+        return 200, service.get_ruling(segments[1])
+
+    if method == "POST" and len(segments) == 3 and segments[0] == "rulings" and segments[2] == "confirm":
+        return 200, service.confirm_ruling(actor_id=actor_id, ruling_id=segments[1])
+
+    if method == "GET" and path == "/rulings":
+        region_id = query.get("region_id", [""])[0]
+        cultivar_id = query.get("cultivar_id", [""])[0]
+        if not region_id or not cultivar_id:
+            raise ValidationError("region_id 与 cultivar_id 不能为空")
+        return 200, service.list_rulings(region_id, cultivar_id)
+
+    if method == "GET" and path == "/reviews":
+        return 200, service.list_open_reviews()
+
+    if method == "GET" and len(segments) == 4 and segments[0] == "regions" \
+            and segments[2] == "cultivars":
+        return 200, service.explain_region(segments[1], segments[3])
+
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -93,13 +156,13 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     """启动本地 HTTP 服务。"""
 
-    parser = argparse.ArgumentParser(description="启动科技战略协作基础服务")
-    parser.add_argument("--database", default="service.sqlite3")
+    parser = argparse.ArgumentParser(description="启动多地点农业试验与推广裁定服务")
+    parser.add_argument("--database", default="trial_service.sqlite3")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     database = Database(args.database)
-    Handler.service = DomainService(database)
+    Handler.service = TrialService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
